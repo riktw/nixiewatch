@@ -35,8 +35,8 @@ impl NixieDisplay {
             segments: segments,
             dot: dot,
             enable: enable,
-            nixie1_value: 2,
-            nixie2_value: 7,
+            nixie1_value: 3,
+            nixie2_value: 8,
             display_counter: 0,
             dot_status: DotStatus::Off,
         };
@@ -120,6 +120,15 @@ impl NixieDisplay {
     }
 }
 
+#[derive(PartialEq, Copy, Clone)]
+enum ShowNext {
+    Idle,
+    Time,
+    Charge,
+    Both,
+    EmptyBattery
+}
+
 pub struct NixieClock {
     nixie_display: NixieDisplay,
     ticks_per_second: u32,
@@ -128,14 +137,11 @@ pub struct NixieClock {
     minutes: u8,
     seconds: u8,
     display_counter: u32,
-    display_status: u32,
-    display_new_status: u32,
-    charge_level: u8
+    display_status: ShowNext,
+    display_new_status: ShowNext,
+    charge_level: u8,
+    displaying: bool
 }
-
-// Ugly...
-const SHOWTIME: u32 = 1;
-const SHOWCHARGE: u32 = 2;
 
 impl NixieClock {
     pub fn new(nixie_display: NixieDisplay, ticks_per_second: u32) -> Self {
@@ -143,13 +149,14 @@ impl NixieClock {
             nixie_display: nixie_display,
             ticks_per_second: ticks_per_second,
             current_tick: 0,
-            hours: 12,
-            minutes: 17,
+            hours: 13,
+            minutes: 37,
             seconds: 0,
-            display_counter: 0,
-            display_status: 0,
-            display_new_status: 0,
-            charge_level: 50
+            display_counter: ticks_per_second * 4,
+            display_status: ShowNext::Idle,
+            display_new_status: ShowNext::Idle,
+            charge_level: 50,
+            displaying: false
         };
         nixie_clock
     }
@@ -164,16 +171,29 @@ impl NixieClock {
         (self.hours, self.minutes)
     }
 
+    #[allow(dead_code)]
     pub fn show_time(&mut self) {
-        self.display_new_status = SHOWTIME;
+        self.display_new_status = ShowNext::Time;
     }
 
-    pub fn show_charge_done(&mut self) {
-        self.display_new_status = SHOWCHARGE;
+    pub fn show_charge(&mut self) {
+        self.display_new_status = ShowNext::Charge;
+    }
+
+    pub fn show_empty(&mut self) {
+        self.display_new_status = ShowNext::EmptyBattery;
+    }
+
+    pub fn show_time_and_charge(&mut self) {
+        self.display_new_status = ShowNext::Both;
     }
 
     pub fn set_charge_level(&mut self, charge_level: u8) {
         self.charge_level = charge_level;
+    }
+
+    pub fn is_display_on(&mut self) -> bool {
+        self.displaying
     }
 
     fn second_passed(&mut self) {
@@ -192,22 +212,26 @@ impl NixieClock {
     }
 
     pub fn tick(&mut self) {
-        self.current_tick = if self.current_tick >= self.ticks_per_second {
+        self.current_tick = if self.current_tick >= (self.ticks_per_second - 1) {
             self.second_passed();
             0
         } else {
             self.current_tick + 1
         };
 
-        if self.display_new_status != 0 {
+        if self.display_new_status != ShowNext::Idle {
             self.display_counter = 0;
             self.display_status = self.display_new_status;
-            self.display_new_status = 0;
+            self.display_new_status = ShowNext::Idle;
         }
 
-        if self.display_counter < self.ticks_per_second * 3 {
+        if self.display_counter < self.ticks_per_second * 4 {
             self.display_counter += 1;
+            self.displaying = true;
+        } else {
+            self.displaying = false;
         }
+
 
         let mut charge_value: u8 = 10 + (self.charge_level / 16); // 0 to 100 convert to 0 to 6.
         if charge_value >= 16 {charge_value = 16;}
@@ -215,30 +239,37 @@ impl NixieClock {
         if self.display_counter <= self.ticks_per_second {  //Show first digit
             self.nixie_display.enable.set_high().ok();
 
-            if self.display_status == SHOWTIME {
+            if self.display_status == ShowNext::Time || self.display_status == ShowNext::Both {
                 self.nixie_display.set_digit(0, self.hours / 10, DotStatus::Digit1);
                 self.nixie_display.set_digit(1, self.hours % 10, DotStatus::Digit1);
-            } else if self.display_status == SHOWCHARGE {
-                self.nixie_display.set_digit(0, charge_value, DotStatus::Off);
-                self.nixie_display.set_digit(1, charge_value, DotStatus::Off);
+            } else if self.display_status == ShowNext::EmptyBattery {
+                self.nixie_display.set_digit(0, 10, DotStatus::Digit1);
+                self.nixie_display.set_digit(1, 10, DotStatus::Digit1);
             }
             self.nixie_display.update();
 
-        } else if self.display_counter <=  self.ticks_per_second * 2 { //Show first digit
+        } else if self.display_counter <=  self.ticks_per_second * 2 { //Show second digit
             self.nixie_display.enable.set_high().ok();
 
-            if self.display_status == SHOWTIME {
+            if self.display_status == ShowNext::Time || self.display_status == ShowNext::Both {
                 self.nixie_display.set_digit(0, self.minutes / 10, DotStatus::Digit2);
                 self.nixie_display.set_digit(1, self.minutes % 10, DotStatus::Digit2);
-            } else if self.display_status == SHOWCHARGE {
-                self.nixie_display.set_digit(0, charge_value, DotStatus::Off);
-                self.nixie_display.set_digit(1, charge_value, DotStatus::Off);
+            } else if self.display_status == ShowNext::EmptyBattery {
+                self.nixie_display.set_digit(0, 10, DotStatus::Digit2);
+                self.nixie_display.set_digit(1, 10, DotStatus::Digit2);
             }
             self.nixie_display.update();
 
+        } else if self.display_counter <=  self.ticks_per_second * 3 { //Show third digit
+            if self.display_status == ShowNext::Both {
+                self.nixie_display.enable.set_high().ok();
+                self.nixie_display.set_digit(0, charge_value, DotStatus::Off);
+                self.nixie_display.set_digit(1, charge_value, DotStatus::Off);
+                self.nixie_display.update();
+            }
         } else {
             self.nixie_display.off();
-            self.display_status = 0;
+            self.display_status = ShowNext::Idle;
         }
 
     }

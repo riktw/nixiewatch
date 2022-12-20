@@ -66,7 +66,36 @@ impl UsbSerial {
         }
     }
 
-    pub fn handle(&mut self, hours: u8, minutes: u8) -> bool {
+    fn print_battery_status(&mut self, battery_status: u8, charge_status: bool) {
+        let serial = self.serial.as_mut().unwrap();
+
+        let mut write_offset = 0;
+        let mut send_buffer: [u8; 4] = [b'0'; 4];
+        battery_status.numtoa_str(10, &mut send_buffer[0..3]);
+        send_buffer[3] = b'\n';
+
+        while write_offset < send_buffer.len() {
+            match serial.write(&send_buffer[write_offset..send_buffer.len()]) {
+                Ok(len) if len > 0 => {
+                    write_offset += len;
+                }
+                _ => {}
+            }
+        }
+
+        let send_buffer = if charge_status { "Charged!\n" } else { "Charging\n"};
+        write_offset = 0;
+        while write_offset < send_buffer.len() {
+            match serial.write(&send_buffer.as_bytes()[write_offset..send_buffer.len()]) {
+                Ok(len) if len > 0 => {
+                    write_offset += len;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn handle(&mut self, hours: u8, minutes: u8, battery_status: u8, charge_status: bool) -> bool {
         let usb_dev = self.device.as_mut().unwrap();
         let serial = self.serial.as_mut().unwrap();
 
@@ -81,6 +110,7 @@ impl UsbSerial {
             Ok(count) if count > 0 => {
             if receive_buffer.iter().find(| &&x| x == '?' as u8) != None {
                 self.print_time(hours, minutes);
+                self.print_battery_status(battery_status, charge_status);
             }
             else if receive_buffer.iter().find(| &&x| x == ':' as u8) != None {
                 if count >= 5 {
@@ -114,7 +144,6 @@ impl UsbSerial {
         }
     }
 
-    //TODO: make a struct for this
     pub fn get_time(&mut self) -> (u8, u8) {
         (self.hours, self.minutes)
     }

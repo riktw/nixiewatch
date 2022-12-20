@@ -2,8 +2,8 @@
 #![no_std]
 
 //TODO:
-// 1. rename all SCHARGE_STATUS and other static muts to one clear naming scheme
 // 2. enum for nixie display status
+// 3. display_counter: ticks_per_second * 4 in nixie_segments is ugly, make it count down instead of up.
 
 use panic_halt as _;
 
@@ -35,9 +35,11 @@ use core::ops::DerefMut;
 
 use mpu6050::*;
 
-static HOURS: AtomicU8 = AtomicU8::new(0);
-static MINUTES: AtomicU8 = AtomicU8::new(0);
-static TIME_SET: AtomicBool = AtomicBool::new(false);
+static HOURS: AtomicU8 = AtomicU8::new(13);
+static MINUTES: AtomicU8 = AtomicU8::new(37);
+static BATTERY_STATUS: AtomicU8 = AtomicU8::new(0);
+static BATTERY_CHARGE_DONE: AtomicBool = AtomicBool::new(false);
+static TIME_SET: AtomicBool = AtomicBool::new(true);
 
 static MOVEMENT_DETECTED: AtomicBool = AtomicBool::new(false);
 
@@ -91,13 +93,12 @@ fn EXTI4_15() {
 // interrupt trips when the timer timed out
 #[interrupt]
 fn TIM14() {
-  //change to if let (&mut Some(ref mut nixie1), &mut Some(ref mut nix?
   static mut INT: Option<Timer<TIM14>> = None;
-  static mut SNIXIEDISPLAY: Option<NixieClock> = None;
-  static mut SCHARGE_STATUS: Option<gpioa::PA1<Input<Floating>>> = None;
+  static mut NIXIEDISPLAY: Option<NixieClock> = None;
+  static mut CHARGESTATUS: Option<gpioa::PA1<Input<Floating>>> = None;
   static mut COUNTER: u8 = 0;
 
-  static mut SBATTERY_VOLTAGE: Option<gpioa::PA0<Analog>> = None;
+  static mut BATTERYVOLTAGE: Option<gpioa::PA0<Analog>> = None;
   static mut SADC: Option<Adc<>> = None;
 
   let int = INT.get_or_insert_with(|| {
@@ -106,13 +107,13 @@ fn TIM14() {
     })
   });
 
-  let nixie_clock = SNIXIEDISPLAY.get_or_insert_with(|| {
+  let nixie_clock = NIXIEDISPLAY.get_or_insert_with(|| {
     cortex_m::interrupt::free(|cs| {
       NIXIE_DISPLAY.borrow(cs).replace(None).unwrap()
     })
   });
 
-  let charge_status = SCHARGE_STATUS.get_or_insert_with(|| {
+  let charge_status = CHARGESTATUS.get_or_insert_with(|| {
     cortex_m::interrupt::free(|cs| {
       CHARGE_STATUS.borrow(cs).replace(None).unwrap()
     })
@@ -125,13 +126,11 @@ fn TIM14() {
   });
 
 
-  let battery_voltage = SBATTERY_VOLTAGE.get_or_insert_with(|| {
+  let battery_voltage = BATTERYVOLTAGE.get_or_insert_with(|| {
     cortex_m::interrupt::free(|cs| {
       BATTERY_VOLTAGE.borrow(cs).replace(None).unwrap()
     })
   });
-
-
 
   nixie_clock.tick();
   if TIME_SET.load(Ordering::Relaxed) {
@@ -143,10 +142,16 @@ fn TIM14() {
     MINUTES.store(minutes, Ordering::Relaxed);
   }
 
-  let mut battery_charge: u16 = adc.read(battery_voltage).unwrap();
-  battery_charge = battery_charge - 2050; // half the voltage, 3.5 to 4.2V becomes 1.75 to 2.1. Remove offset.
-  battery_charge = battery_charge / 4; // 0 to 350mV is around 0 to 400.
-  nixie_clock.set_charge_level(battery_charge as u8);
+  if nixie_clock.is_display_on() == false {
+    let mut battery_charge: u16 = adc.read(battery_voltage).unwrap();
+    if battery_charge < 2100 {battery_charge = 2100};
+    battery_charge = battery_charge - 2100; // Voltage is halved as the input is 3.3V max. 3.6 to 4.2V becomes 1.8 to 2.1. Remove offset.
+    battery_charge = battery_charge / 4; // 0 to 300mV is around 0 to 400.
+    if battery_charge >= 100 {battery_charge = 100};
+    nixie_clock.set_charge_level(battery_charge as u8);
+    BATTERY_STATUS.store(battery_charge as u8, Ordering::Relaxed);
+    BATTERY_CHARGE_DONE.store(charge_status.is_high().unwrap(), Ordering::Relaxed);
+  }
 
 
   *COUNTER = *COUNTER + 1;
@@ -156,34 +161,12 @@ fn TIM14() {
 
     if MOVEMENT_DETECTED.load(Ordering::Relaxed) {
       MOVEMENT_DETECTED.store(false, Ordering::Relaxed);
-      nixie_clock.show_time();
-    } else if charge_status.is_high().unwrap() {
-      nixie_clock.show_charge_done();
-    }
-
-
-    nixie_clock.show_charge_done(); //test
-
-
-    /* 
-    let mut hello_world: [u8; 64] = [0; 64];
-    let hello_string = b"Motion:  \n";
-    hello_world[0..hello_string.len()].clone_from_slice(hello_string);
-    let acc = mpu.get_acc_angles().unwrap();
-    let roll = (acc[0] * 1000.0) as i32;
-    let yaw = (acc[1] * 1000.0) as i32;
-    roll.numtoa(10, &mut hello_world[hello_string.len()-10..hello_string.len()-6]);
-    yaw.numtoa(10, &mut hello_world[hello_string.len()-6..hello_string.len()-1]);
-
-    cortex_m::interrupt::free(|cs| {
-      if let (&mut Some(ref mut usb_serial), ) = (
-        USB_SERIAL.borrow(cs).borrow_mut().deref_mut(),
-      ) {
-        usb_serial.print(hello_world, hello_string.len());
+      if BATTERY_STATUS.load(Ordering::Relaxed) > 10 {
+        nixie_clock.show_time_and_charge();
+      } else {
+        nixie_clock.show_empty();
       }
-    });*/
-
-
+    }
   }
 
   int.wait().ok();
@@ -195,7 +178,8 @@ fn USB() {
     if let (&mut Some(ref mut usb_serial), ) = (
       USB_SERIAL.borrow(cs).borrow_mut().deref_mut(),
     ) {
-      if usb_serial.handle(HOURS.load(Ordering::Relaxed), MINUTES.load(Ordering::Relaxed)) {
+      if usb_serial.handle(HOURS.load(Ordering::Relaxed), MINUTES.load(Ordering::Relaxed),
+                                      BATTERY_STATUS.load(Ordering::Relaxed), BATTERY_CHARGE_DONE.load(Ordering::Relaxed)) {
         let (hours, minutes) = usb_serial.get_time();
         HOURS.store(hours, Ordering::Relaxed);
         MINUTES.store(minutes, Ordering::Relaxed);
@@ -288,6 +272,7 @@ fn main() -> ! {
       let i2c = I2c::i2c1(p.I2C1, (scl, sda), 100.khz(), &mut rcc);
       let mut mpu = Mpu6050::new(i2c);
       let mut delay = Delay::new(cp.SYST, &rcc);
+      delay.delay_ms(10_u16);
       mpu.init(&mut delay).unwrap();
       mpu.setup_motion_detection().unwrap();
 
@@ -297,7 +282,7 @@ fn main() -> ! {
       mpu.write_bit(0x6C, 2, true).unwrap();
       *MPU.borrow(cs).borrow_mut() = Some(mpu);
 
-      // Set up a timer expiring after 1s
+      // Set up a timer for 200Hz interrupts
       let mut timer = Timer::tim14(p.TIM14, Hertz(200), &mut rcc);
       // Generate an interrupt when the timer expires
       timer.listen(Event::TimeOut);
@@ -307,7 +292,6 @@ fn main() -> ! {
       let battery_voltage = gpioa.pa0.into_analog(cs);
       *ADC.borrow(cs).borrow_mut() = Some(adc);
       *BATTERY_VOLTAGE.borrow(cs).borrow_mut() = Some(battery_voltage);
-
 
       // Move the timer into our global storage
       *GINT.borrow(cs).borrow_mut() = Some(timer);
