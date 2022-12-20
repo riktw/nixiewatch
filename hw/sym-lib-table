@@ -1,0 +1,3 @@
+(sym_lib_table
+  (lib (name "Nixiewatch-rescue")(type "Legacy")(uri "${KIPRJMOD}/Nixiewatch-rescue.lib")(options "")(descr ""))
+)
